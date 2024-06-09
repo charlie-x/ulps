@@ -1,0 +1,326 @@
+// Export the EAGLE cream layers to DXF for the Craft-ROBO cutting plotter.
+//
+// Copyright (c) 2010 Switch Science, Inc.
+// updated 2024 charliex@nullspacelabs.com
+//
+// Usage:
+// Type "run cream-dxf" in the board editor window.
+//
+// Options:
+//   -2    Cut two times for each lines.
+//   -c    Cut off corners of pads. The resulting pads are octagons.
+//   -f    Add a frame around the DXF output.
+//   -m    Mitre the corners of the frame.
+//   -mb   Merge the bottom tcream stencil onto the top layer. (todo)
+//
+
+string Version = "1.01";
+
+#usage " \
+<b>Export the EAGLE cream layers to a DXF for cutter/laser</b> \
+<p> \
+Generates DXF files for the top and bottom cream layers of an EAGLE board.\
+<p> \
+Options are available to cut each line twice, cut off corners of pads, add a frame around the DXF output, mitre the corners of the frame \
+<p> \
+<author>Author: Switch Science, Inc<br> \
+Modified by: charliex / nullspace Labs - charliex@nullspacelabs.com</author> \
+<p> \
+Version: 1.01 \
+"
+
+// configuration
+real SHRINK_WIDTH = 0.00;      // unit: mm
+real MIN_CORNERRADIUS = 0.05;  // unit: mm
+
+real kerf_adjust = 0.03;   // unit:mm amount to grow/shrink frame by
+real frame_width  = 150.0-kerf_adjust; // unit: mm
+real frame_height = 100.0-kerf_adjust; // unit: mm
+
+// flags
+int CORNERCUT = 0;             // 
+int CUTTIMES = 1;
+int ADD_FRAME = 0;             // add frame ?
+int MITRE_CORNERS = 0;         // mitred corners ?
+int DEBUG = 0;                 // add debugging output to the DXF
+
+// global variables for bounding box
+real minX, minY, maxX, maxY;
+
+string HEADER_MM =
+"  0\n"
+"SECTION\n"
+"  2\n"
+"HEADER\n"
+"  9\n"
+"$ACADVER\n"
+"  1\n"
+"AC1013\n"
+"  9\n"
+"$MEASUREMENT\n"
+" 70\n"
+"     1\n"            // unit: mm
+"  0\n"
+"ENDSEC\n"
+"  0\n"
+"SECTION\n"
+"  2\n"
+"ENTITIES\n";
+
+string HEADER_INCH =
+"  0\n"
+"SECTION\n"
+"  2\n"
+"HEADER\n"
+"  9\n"
+"$ACADVER\n"
+"  1\n"
+"AC1013\n"
+"  9\n"
+"$MEASUREMENT\n"
+" 70\n"
+"     0\n"            // unit: inches
+"  0\n"
+"ENDSEC\n"
+"  0\n"
+"SECTION\n"
+"  2\n"
+"ENTITIES\n";
+
+string POLYLINE =
+"  0\n"
+"LWPOLYLINE\n"
+"  8\n"
+"0\n"                  // layer
+" 62\n"
+"7\n"                  // color
+" 90\n"
+"%d\n"                 // number of points
+" 70\n"
+"%d\n";                // 0=open 1=close
+
+string POLYLINE_POINT =
+" 10\n"
+"%f\n"
+" 20\n"
+"%f\n";
+
+string LINE =
+"  0\n"
+"LINE\n"
+"  8\n"
+"0\n"                  // layer
+" 10\n"
+"%f\n"                 // start x
+" 20\n"
+"%f\n"                 // start y
+" 11\n"
+"%f\n"                 // end x
+" 21\n"
+"%f\n";                // end y
+
+string ARC =
+"  0\n"
+"ARC\n"
+"  8\n"
+"0\n"                  // layer
+" 10\n"
+"%f\n"                 // center x
+" 20\n"
+"%f\n"                 // center y
+" 40\n"
+"%f\n"                 // radius
+" 50\n"
+"%f\n"                 // start angle
+" 51\n"
+"%f\n";                // end angle
+
+string CIRCLE =
+"  0\n"
+"CIRCLE\n"
+"  8\n"
+"0\n"                  // layer
+" 10\n"
+"%f\n"                 // center x
+" 20\n"
+"%f\n"                 // center y
+" 40\n"
+"%f\n";                // radius
+
+string TRAILER =
+"  0\n"
+"ENDSEC\n"
+"  0\n"
+"EOF\n";
+
+
+string TEXT =
+"  0\n"
+"TEXT\n"
+"  8\n"
+"0\n"                  // layer
+" 10\n"
+"%f\n"                 // insertion x
+" 20\n"
+"%f\n"                 // insertion y
+" 40\n"
+"0.7\n"                // text height
+"  1\n"
+"%s\n";                // text string
+
+// Conversion factor (for mm to inches conversion)
+real CONVERSION_FACTOR = 1.0;
+
+// popup to get user preference in mm or inches
+void getUserPreference() {
+  int choice = dlgMessageBox("Select output unit", "MM", "Inches");
+  if (choice == 2) {
+    CONVERSION_FACTOR = 25.4; // Conversion factor from mm to inches
+  }
+}
+
+// popup for adding frame
+void getFramePreference() {
+  ADD_FRAME = dlgMessageBox("Do you want to add a frame?", "No", "Yes") == 1;
+  if (ADD_FRAME) {
+    MITRE_CORNERS = dlgMessageBox("Do you want to mitre the corners?", "No", "Yes") == 1;
+  }
+}
+
+// process each layer and calculate the bounding box
+int processLayer(UL_BOARD B, int layer) {
+  int count = 0;
+  int cream = (layer == LAYER_TOP ? LAYER_TCREAM : LAYER_BCREAM);
+  B.elements(E) {
+    E.package.contacts(C) {
+      if (C.smd && ( C.smd.flags & SMD_FLAG_CREAM ) && C.smd.layer == layer) {
+
+        real x = u2mm(C.smd.x) * CONVERSION_FACTOR;
+        real y = u2mm(C.smd.y) * CONVERSION_FACTOR;
+
+        real w = (u2mm(C.smd.dx[cream]) / 2.0) - SHRINK_WIDTH;
+        real h = (u2mm(C.smd.dy[cream]) / 2.0) - SHRINK_WIDTH;
+        
+        real a = C.smd.angle / 180.0 * PI;
+
+        real wc = w * cos(a);
+        real hs = h * sin(a);
+        real ws = w * sin(a);
+        real hc = h * cos(a);
+
+        real r = max(min(w, h) * C.smd.roundness / 100.0, MIN_CORNERRADIUS);
+        if (CORNERCUT && h > r && w > r) {
+          real rc = r * cos(a);
+          real rs = r * sin(a);
+          printf(POLYLINE, 8 * CUTTIMES + 1, 1);            // 1: closed
+          printf(POLYLINE_POINT, x + wc, y + ws);           // ( w,    0)
+          for (int i = 0; i < CUTTIMES; i++) {
+            printf(POLYLINE_POINT, x + wc - hs + rs, y + ws + hc - rc); // ( w,    h-r)
+            printf(POLYLINE_POINT, x + wc - rc - hs, y + ws - rs + hc); // ( w-r,  h)
+            printf(POLYLINE_POINT, x - wc + rc - hs, y - ws + rs + hc); // (-w+r,  h)
+            printf(POLYLINE_POINT, x - wc - hs + rs, y - ws + hc - rc); // (-w,    h-r)
+            printf(POLYLINE_POINT, x - wc + hs - rs, y - ws - hc + rc); // (-w,   -h+r)
+            printf(POLYLINE_POINT, x - wc + rc + hs, y - ws + rs - hc); // (-w+r, -h)
+            printf(POLYLINE_POINT, x + wc - rc + hs, y + ws - rs - hc); // ( w-r, -h)
+            printf(POLYLINE_POINT, x + wc + hs - rs, y + ws - hc + rc); // ( w,   -h+r)
+          }
+        } else {
+          
+
+          printf(POLYLINE, 4 * CUTTIMES + 1, 1);            // 1: closed
+          printf(POLYLINE_POINT, x + wc, y + ws);           // ( w,  0)
+          for (int i = 0; i < CUTTIMES; i++) {
+            printf(POLYLINE_POINT, x + wc - hs, y + ws + hc); // ( w,  h)
+            printf(POLYLINE_POINT, x - wc - hs, y - ws + hc); // (-w,  h)
+            printf(POLYLINE_POINT, x - wc + hs, y - ws - hc); // (-w, -h)
+            printf(POLYLINE_POINT, x + wc + hs, y + ws - hc); // ( w, -h)
+          }
+          
+        }
+
+        // debug, text annotation with element and contact names
+        if (DEBUG) 
+          printf(TEXT, x, y, string(E.name + " " + C.smd.name));
+
+        // Update bounding box
+        minX = min(minX, x - w);
+        maxX = max(maxX, x + w);
+        minY = min(minY, y - h);
+        maxY = max(maxY, y + h);
+
+        count++;
+      }
+    }
+  }
+  return count;
+}
+
+// add a frame with optional mitred corners
+void addFrame(real centerX, real centerY, real width, real height, int mitre) {
+  real halfWidth = width / 2;
+  real halfHeight = height / 2;
+
+  if (mitre) {
+    real mitreLength = 5.0 * CONVERSION_FACTOR; // Length of the mitre cut
+
+    // Bottom line with mitres
+    printf(LINE, centerX - halfWidth + mitreLength, centerY - halfHeight, centerX + halfWidth - mitreLength, centerY - halfHeight);
+    printf(LINE, centerX + halfWidth - mitreLength, centerY - halfHeight, centerX + halfWidth, centerY - halfHeight + mitreLength);
+
+    // Right line with mitres
+    printf(LINE, centerX + halfWidth, centerY - halfHeight + mitreLength, centerX + halfWidth, centerY + halfHeight - mitreLength);
+    printf(LINE, centerX + halfWidth, centerY + halfHeight - mitreLength, centerX + halfWidth - mitreLength, centerY + halfHeight);
+
+    // Top line with mitres
+    printf(LINE, centerX + halfWidth - mitreLength, centerY + halfHeight, centerX - halfWidth + mitreLength, centerY + halfHeight);
+    printf(LINE, centerX - halfWidth + mitreLength, centerY + halfHeight, centerX - halfWidth, centerY + halfHeight - mitreLength);
+
+    // Left line with mitres
+    printf(LINE, centerX - halfWidth, centerY + halfHeight - mitreLength, centerX - halfWidth, centerY - halfHeight + mitreLength);
+    printf(LINE, centerX - halfWidth, centerY - halfHeight + mitreLength, centerX - halfWidth + mitreLength, centerY - halfHeight);
+  } else {
+    // Draw the frame without mitres
+    printf(LINE, centerX - halfWidth, centerY - halfHeight, centerX + halfWidth, centerY - halfHeight); // Bottom
+    printf(LINE, centerX + halfWidth, centerY - halfHeight, centerX + halfWidth, centerY + halfHeight); // Right
+    printf(LINE, centerX + halfWidth, centerY + halfHeight, centerX - halfWidth, centerY + halfHeight); // Top
+    printf(LINE, centerX - halfWidth, centerY + halfHeight, centerX - halfWidth, centerY - halfHeight); // Left
+  }
+}
+
+for (int i = 1; i < argc; i++) {
+  if (argv[i] == "-c")
+    CORNERCUT = 1;
+  else if (argv[i] == "-2")
+    CUTTIMES = 2;
+}
+
+getUserPreference();
+getFramePreference();
+
+minX = 1e10; minY = 1e10; maxX = -1e10; maxY = -1e10;
+
+board(B) {
+  int t, b;
+
+  output(filesetext(B.name, "-tcream.dxf")) {
+    printf("%s", (CONVERSION_FACTOR == 1.0) ? HEADER_MM : HEADER_INCH);
+    t = processLayer(B, LAYER_TOP);
+    if (ADD_FRAME) {
+      addFrame((minX + maxX) / 2, (minY + maxY) / 2, frame_width * CONVERSION_FACTOR, frame_height * CONVERSION_FACTOR, MITRE_CORNERS);
+    }
+    printf("%s", TRAILER);
+  }
+
+  output(filesetext(B.name, "-bcream.dxf")) {
+    printf("%s", (CONVERSION_FACTOR == 1.0) ? HEADER_MM : HEADER_INCH);
+    b = processLayer(B, LAYER_BOTTOM);
+    if (ADD_FRAME) {
+      addFrame((minX + maxX) / 2, (minY + maxY) / 2, frame_width * CONVERSION_FACTOR, frame_height * CONVERSION_FACTOR, MITRE_CORNERS);
+    }
+    printf("%s", TRAILER);
+  }
+
+  string message;
+  sprintf(message, ";DXF files generated with %d+%d objects", t, b);
+  dlgMessageBox(message);
+}
